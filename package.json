@@ -1,0 +1,23 @@
+{
+  "name": "light-client",
+  "version": "0.0.1",
+  "description": "Beacon light-client",
+  "author": "Roman Romanov",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "docker:build": "docker build --rm -t finality-watcher .",
+    "start": "node --loader ts-node/esm ./index.ts"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10",
+    "@types/node": "^18",
+    "chai": "^4.3.7",
+    "ts-node": "^10",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@lodestar/light-client": "~1.12",
+    "@lodestar/beacon-node": "~1.12"
+  }
+}
