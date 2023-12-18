@@ -2,22 +2,35 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {EventEmitter} from "events";
 
+import blst from "@chainsafe/blst";
 // import StrictEventEmitter from "strict-event-emitter-types";
 
 import {Tree} from "@chainsafe/persistent-merkle-tree";
 
-// import {EPOCHS_PER_SYNC_COMMITTEE_PERIOD} from "@lodestar/params";
+import {
+  EPOCHS_PER_SYNC_COMMITTEE_PERIOD,
+  SLOTS_PER_EPOCH,
+} from "@lodestar/params";
 // import {
 //   computeSyncPeriodAtEpoch,
 //   // computeSyncPeriodAtSlot,
 //   computeEpochAtSlot,
 // } from "./lodestar/light-client/utils/clock.js";
-import {allForks, ssz} from "@lodestar/types";
+import {
+  allForks,
+  ssz,
+  Epoch,
+  Slot,
+  SyncPeriod,
+} from "@lodestar/types";
 import {
   // FINALIZED_ROOT_GINDEX,
   BLOCK_BODY_EXECUTION_PAYLOAD_GINDEX,
+  ForkName,
+  ForkSeq,
   ForkExecution,
 } from "@lodestar/params";
+// import {MIN_SYNC_COMMITTEE_PARTICIPANTS, SYNC_COMMITTEE_SIZE, ForkName, ForkSeq, ForkExecution} from "@lodestar/params";
 
 // import {
 //   Lightclient,
@@ -31,7 +44,9 @@ import {
   LightClientRestTransport,
   // LightClientTransport,
 } from '@lodestar/light-client/transport';
+// import { createChainForkConfig } from '@lodestar/chain';
 import { createChainForkConfig } from '@lodestar/config';
+import { executionPayloadToPayloadHeader } from '@lodestar/state-transition';
 import {
   genesisData,
   networksChainConfig,
@@ -54,22 +69,33 @@ import type {
   // LightclientInitArgs,
   // GenesisData,
 } from '@lodestar/light-client';
+import type {
+  // ssz,
+  ContainerType,
+} from '@chainsafe/ssz';
+// import { ContainerType, BitVectorType } from '@chainsafe/ssz';
+import type {
+  altair,
+  phase0,
+  capella,
+} from '@lodestar/types';
+
 // import type {LoggerNodeOpts} from "@lodestar/logger/node";
 
-/*
-export enum RunStatusCode {
-  uninitialized,
-  started,
-  syncing,
-  stopped,
+
+export function computeEpochAtSlot(slot: Slot): Epoch {
+  return Math.floor(slot / SLOTS_PER_EPOCH);
+  // return Math.round((slot + 0.5) / SLOTS_PER_EPOCH);
 }
-*/
-// export const RunStatusCodeName = [
-//   'uninitialized',
-//   'started',
-//   'syncing',
-//   'stopped',
-// ];
+
+export function computeSyncPeriodAtSlot(slot: Slot): SyncPeriod {
+  return computeSyncPeriodAtEpoch(computeEpochAtSlot(slot));
+}
+
+export function computeSyncPeriodAtEpoch(epoch: Epoch): SyncPeriod {
+  return Math.floor(epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+}
+
 
 type NetworkName =
   "mainnet" |
@@ -159,7 +185,6 @@ const replacer = (
   return value;
 };
 
-
 /*
 export const defaultNetworkUrls: Record<NetworkName, {beaconApiUrl: string; elRpcUrl: string}> = {
   [NetworkName.mainnet]: {
@@ -209,21 +234,166 @@ const conf = configs[confName];
 console.log('NetworkName:', confName);
 
 
-const pathDataDir = path.resolve('data');
-if ( !fs.existsSync(pathDataDir) ) {
-  fs.mkdirSync(pathDataDir);
+const rewriteFile = async (fileName: string, data: string) =>
+  fs.promises.appendFile(fileName, data, { 'flag': 'w' })
+;
+
+const formatJSON = (data: object) => JSON.stringify(data, replacer, 2);
+
+class LocalFolder extends EventEmitter {
+  public constructor(
+    private _name: string,
+    private _parent: string, // | LocalFolder,
+  ) {
+    super();
+  }
+
+  public get name(): string {
+    return this._name;
+  }
+  public get parentPath(): string {
+    return this._parent;
+  }
+  public get fullName(): string {
+    return path.join(this.parentPath, this.name);
+  }
+
+  public ensure() {
+    const { fullName, name } = this;
+    if ( !fs.existsSync(fullName) ) {
+      // console.log('create:', name, fullName);
+      fs.mkdirSync(fullName);
+      this.emit('create', name);
+    }
+
+    return this;
+  };
 }
 
-// export enum EventType {
-//   lightClientFinalityUpdate = "light_client_finality_update",
-// }
+class LocalStorageFolder extends LocalFolder {
+  protected constructor(name: string, parent: LocalFolder | string) {
+    super(name, parent instanceof LocalFolder ? parent.fullName : parent);
+  }
 
-// export type LightClientRestEvents = {
-//   [EventType.lightClientFinalityUpdate]: allForks.LightClientFinalityUpdate;
-// };
+  public create(name: string): LocalStorageFolder {
+    const fld = new LocalStorageFolder(name, this);
+    fld.once('create', (...args) => {
+      this.emit('child:create', ...args);
+    });
+    return fld.ensure();
+  }
+}
 
-// type RestEvents = StrictEventEmitter<EventEmitter, LightClientRestEvents>;
+class LocalStorageRootFolder extends LocalStorageFolder {
 
+  public static create(name: string, parentPath: string): LocalStorageRootFolder {
+    return (new LocalStorageRootFolder(name, parentPath)).ensure();
+  };
+
+  protected constructor(name: string, parentPath: string) {
+    super(name, parentPath);
+  }
+}
+
+type TFinalityUpdate = {
+  version: ForkName;
+  data: allForks.LightClientFinalityUpdate
+};
+
+type TOptimisticUpdate = {
+  version: ForkName;
+  data: allForks.LightClientOptimisticUpdate
+};
+
+class JSONLocalStorage extends EventEmitter {
+  public constructor(
+    private _dataDir: LocalStorageRootFolder,
+  ) {
+    super();
+    _dataDir.on('child:create', this.onFolderCreated.bind(this));
+  }
+
+  protected onFolderCreated(name: string) {
+    // console.log('onFolderCreated:', name);
+    this.emit('period:open', +name);
+  }
+
+  public addSyncComiteeUpdate(update: {
+    version: ForkName;
+    data: allForks.LightClientUpdate;
+  }) {
+    const { slot } = update.data.finalizedHeader.beacon;
+    const epoch = computeEpochAtSlot(slot);
+    const period = computeSyncPeriodAtEpoch(epoch);
+    const fn = path.join(
+      this._dataDir.create(`${ period + 1 }`).fullName,
+      'update.json',
+    );
+    return rewriteFile(fn, formatJSON(update));
+  }
+
+  public addFinalityUpdate(update: TFinalityUpdate) {
+    const { slot } = update.data.finalizedHeader.beacon;
+    const fn = this.buildFullFileName(slot, `${ slot }.finality.json`);
+    return rewriteFile(fn, formatJSON(update));
+  }
+
+  public addOptimisticUpdate(update: TOptimisticUpdate) {
+    const { slot } = update.data.attestedHeader.beacon;
+    const fn = this.buildFullFileName(slot, `${ slot }.optimistic.json`);
+    return rewriteFile(fn, formatJSON(update));
+  }
+
+  public addOptimisticUpdateFake(update: TOptimisticUpdate) {
+    const { slot } = update.data.attestedHeader.beacon;
+    const fn = this.buildFullFileName(slot, `${ slot }.fake.json`);
+    return rewriteFile(fn, formatJSON(update));
+  }
+
+  protected buildFullFileName(
+    slot: number,
+    fileName: string,
+  ) {
+    const epoch = computeEpochAtSlot(slot);
+    const period = computeSyncPeriodAtEpoch(epoch);
+    return path.join(
+      this._dataDir.create(`${ period }`).create(`${ epoch }`).fullName,
+      fileName,
+    );
+  }
+}
+
+class OptimisticWatcher
+  extends EventEmitter
+  // extends (EventEmitter as { new (): RestEvents })
+  // extends (EventEmitter as { new (): StrictEventEmitter<EventEmitter, LightClientRestEvents> })
+  // implements LightClientTranspor
+{
+  public constructor(
+    protected transport: LightClientRestTransport, // LightClientTransport,
+  ) {
+    super();
+  }
+
+  public start() {
+    this.run().catch(ex => console.log(ex));
+  }
+
+  private _currentSlot = 0;
+  private async run() {
+    while ( true ) {
+      const update = await this.transport.getOptimisticUpdate();
+      const { slot } = update.data.attestedHeader.beacon;
+
+      if ( this._currentSlot !== slot ) {
+        this._currentSlot = slot;
+        this.emit('optimistic', update);
+      }
+
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
 
 class FinalityWatcher
   extends EventEmitter
@@ -234,7 +404,6 @@ class FinalityWatcher
   public constructor(
     protected transport: LightClientRestTransport, // LightClientTransport,
   ) {
-    //
     super();
   }
 
@@ -258,144 +427,186 @@ class FinalityWatcher
   }
 }
 
+
+export function blockToLightClientHeader(
+  fork: ForkName,
+  block: allForks.AllForksLightClient["BeaconBlock"]
+): allForks.LightClientHeader {
+  const blockSlot = block.slot;
+  const beacon: phase0.BeaconBlockHeader = {
+    slot: blockSlot,
+    proposerIndex: block.proposerIndex,
+    parentRoot: block.parentRoot,
+    stateRoot: block.stateRoot,
+    bodyRoot: (ssz[fork].BeaconBlockBody as allForks.AllForksLightClientSSZTypes["BeaconBlockBody"]).hashTreeRoot(
+      block.body
+    ),
+  };
+  if (ForkSeq[fork] >= ForkSeq.capella) {
+    const blockBody = block.body as allForks.AllForksExecution["BeaconBlockBody"];
+    const execution = executionPayloadToPayloadHeader(ForkSeq[fork], blockBody.executionPayload);
+    return {
+      beacon,
+      execution,
+      executionBranch: getBlockBodyExecutionHeaderProof(fork as ForkExecution, blockBody),
+    } as allForks.LightClientHeader;
+  } else {
+    return {beacon};
+  }
+}
+
 const main = async () => {
+  // const storage = new JSONLocalStorage(pathDataDir);
+  const storage = new JSONLocalStorage(
+    LocalStorageRootFolder.create('data', '.'),
+  );
+
+  type TCapellaBlock = {
+    version: ForkName;
+    data: capella.SignedBeaconBlock;
+  };
+  const buildOptimistic = async (id: string) => {
+    const block = await transport.fetchBlock(id) as TCapellaBlock;
+
+    const update = {
+      attestedHeader: blockToLightClientHeader(
+        ForkName.capella,
+        block.data.message,
+      ),
+    } as capella.LightClientOptimisticUpdate;
+
+    storage.addOptimisticUpdateFake({
+      version: ForkName.capella, // 'capella',
+      data: update,
+    })
+    .then(() => console.log('FKE', block.data.message.slot))
+    .catch(ex => console.log(ex));
+  };
+
+  const onOptimisticUpdate = (update: TOptimisticUpdate) => {
+    const { slot } = update.data.attestedHeader.beacon;
+
+    storage.addOptimisticUpdate(update)
+    .then(() => console.log('OPT', slot))
+    .catch(ex => console.log(ex));
+  };
+
+  const DOMAIN_SYNC_COMMITTEE = Uint8Array.from([7, 0, 0, 0]);
+  const CAPELLA_FORK_VERSION = fromHexString("0x90000072"); // sepolia
+  // curl -X 'GET' 'http://${ hostWithPort }/eth/v1/beacon/genesis' \
+  //   -H 'accept: application/json'
+  const jsonGenesis = { data: {
+    genesis_time: 1655733600,
+    genesis_validators_root:
+      '0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078',
+    genesis_fork_version: '0x90000069',
+  }};
+
+  function getBit(
+    n: number,
+    bytearray: Uint8Array,
+  ): Boolean {
+    const idxByte = Math.floor(n / 8);
+    const idxBit = 1 << (n % 8);
+    return !!(idxBit & bytearray[idxByte]);
+  }
+
+  const verifySignature = (
+    update: allForks.LightClientFinalityUpdate,
+    syncCommittee: altair.SyncCommittee,
+  ) => {
+    const participantPubkeys: blst.PublicKey[] = [];
+    const {
+      bitLen,
+      uint8Array,
+    } = update.syncAggregate.syncCommitteeBits;
+    for(let i = 0; i < bitLen; i++) {
+      if ( getBit(i, uint8Array) ) {
+        participantPubkeys.push(
+          blst.PublicKey.fromBytes(
+            syncCommittee.pubkeys[i],
+          ),
+        );
+      }
+    }
+
+    const genesis = ssz.phase0.Genesis.fromJson(jsonGenesis.data);
+
+    // computeDomain
+    const forkDataRoot = ssz.phase0.ForkData.hashTreeRoot({
+      currentVersion: CAPELLA_FORK_VERSION,
+      genesisValidatorsRoot: genesis.genesisValidatorsRoot,
+    });
+    const domain = new Uint8Array(32);
+    domain.set(DOMAIN_SYNC_COMMITTEE, 0);
+    domain.set(forkDataRoot.slice(0, 28), 4);
+
+    const objectRoot = ssz.phase0.BeaconBlockHeader.hashTreeRoot(
+      update.attestedHeader.beacon
+    );
+    const signingRoot = ssz.phase0.SigningData.hashTreeRoot({
+      objectRoot,
+      domain,
+    });
+
+    const aggPubkey = blst.aggregatePubkeys(participantPubkeys);
+    const sig = blst.Signature.fromBytes(
+      update.syncAggregate.syncCommitteeSignature
+    );
+
+    const res = blst.verify(signingRoot, aggPubkey, sig);
+    console.log(res);
+  };
+
+  const onFinalityUpdate = (update: TFinalityUpdate) => {
+    // onOptimisticUpdate(extractOptimistic(update));
+    const { slot, parentRoot } = update.data.finalizedHeader.beacon;
+
+    // !!!
+    // verifySignature
+
+    storage.addFinalityUpdate(update)
+    .then(() => console.log('FIN', slot))
+    .catch(ex => console.log(ex));
+
+    const formatHash = (hash: Uint8Array): string => {
+      const strHashHEX = Buffer.from(hash).toString('hex');
+      return `0x${ strHashHEX }`;
+    };
+    buildOptimistic(formatHash(parentRoot));
+  };
 
   const {BEACON_API: baseUrl} = conf;
   const config = createChainForkConfig(conf.chainConfig);
   const api = getClient({ baseUrl, fetch: wrappedFetch }, { config });
   const transport = new LightClientRestTransport(api);
 
-  const svcWatcher = new FinalityWatcher(transport);
-  svcWatcher.on('finality', (update) => {
-    const { slot } = update.data.attestedHeader.beacon;
+  const fetchSyncComitee = async (newPeriod: number) => {
+    console.log('fetchSyncComitee for:', newPeriod);
+    const updates = await transport.getUpdates(newPeriod - 1, 1);
+    const { slot } = updates[0].data.finalizedHeader.beacon;
 
-    fs.promises.appendFile(
-      path.join(pathDataDir, `${ slot }.finality.json`),
-      JSON.stringify(update, replacer, 2),
-      { 'flag': 'w' },
-    )
-    .then(() => console.log(slot))
-    .catch(ex => console.log(ex));
+    storage.addSyncComiteeUpdate(updates[0]).catch(ex => console.log(ex));
+
+    const epoch = computeEpochAtSlot(slot);
+    const period = computeSyncPeriodAtEpoch(epoch);
+    console.log(newPeriod, period, epoch, slot);
+  };
+  storage.on('period:open', (period: number) => {
+    console.log('period:open', period);
+    fetchSyncComitee(period).catch(ex => console.log(ex));
   });
 
+  const svcWatcher = new FinalityWatcher(transport);
+
+  svcWatcher.on('finality', onFinalityUpdate);
   svcWatcher.start();
 
-  // // transport.fetchBlock()
-  // const f = await transport.getFinalityUpdate();
-  // let slot = f.data.attestedHeader.beacon.slot;
+  const svcOptimisticWatcher = new OptimisticWatcher(transport);
+  svcOptimisticWatcher.on('optimistic', onOptimisticUpdate);
+  svcOptimisticWatcher.start();
 
-/*
-  while ( true ) {
-    const currentEpoch = computeEpochAtSlot(slot);
-    // const epochsIntoPeriod = currentEpoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-    // Start fetching updates with some lookahead
-    // if (EPOCHS_PER_SYNC_COMMITTEE_PERIOD - epochsIntoPeriod <= LOOKAHEAD_EPOCHS_COMMITTEE_SYNC) {
-    const period = computeSyncPeriodAtEpoch(currentEpoch);
-    // console.log(period);
-    const updates = await transport.getUpdates(period, 1);
-
-    if ( slot !== updates[0].data.attestedHeader.beacon.slot ) {
-      slot = updates[0].data.attestedHeader.beacon.slot;
-      console.log(period, currentEpoch, slot, updates[0].data.finalizedHeader.beacon.slot);
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-*/
-  // console.log(JSON.stringify(updates[0], replacer, 2));
-/*
-  while ( true ) {
-    try {
-      const [
-        update,
-        finality,
-      ] = await Promise.all([
-        transport.getOptimisticUpdate(),
-        transport.getFinalityUpdate(),
-      ]);
-      // const update = await transport.getOptimisticUpdate();
-      // const finality = await transport.getFinalityUpdate();
-      // this.processOptimisticUpdate(update.data);
-      // if ( slot !== update.data.attestedHeader.beacon.slot ) {
-      if ( slot !== update.data.attestedHeader.beacon.slot ) {
-        console.log(
-          slot,
-          update.data.attestedHeader.beacon.slot,
-          update.data.signatureSlot,
-          finality.data.attestedHeader.beacon.slot,
-          ( (update.data.attestedHeader.beacon.slot - slot > 1)
-            || (update.data.signatureSlot - update.data.attestedHeader.beacon.slot > 1)
-          ) ? '!' : '',
-        );
-
-        fs.promises.appendFile(
-          path.join(pathDataDir, `${ update.data.attestedHeader.beacon.slot }.json`),
-          JSON.stringify(update, replacer, 2),
-          { 'flag': 'w' },
-        ).catch(ex => console.log(ex));
-
-        const b = await transport.fetchBlock(update.data.attestedHeader.beacon.slot.toString());
-
-        const strArrExecutionProof = getBlockBodyExecutionHeaderProof(
-          b.version as ForkExecution,
-          b.data.message.body as allForks.AllForksExecution["BeaconBlockBody"], // as TBeaconBlockBody,
-        ).map(
-          (a) => Buffer.from(a).toString('hex'),
-        );
-
-        console.log(strArrExecutionProof);
-
-        slot = update.data.attestedHeader.beacon.slot;
-      }
-
-      await new Promise((r) => setTimeout(r, 1000));
-    } catch (e) {
-      logger.error("Error fetching getLatestHeadUpdate", e as Error);
-    }
-  }
-*/
 }
-/*
-const main2 = async () => {
-  const {BEACON_API: baseUrl, checkpointRoot, genesisData} = conf;
-  const config = createChainForkConfig(conf.chainConfig);
-  const api = getClient({ baseUrl, fetch: wrappedFetch }, { config });
-  const transport = new LightClientRestTransport(api);
-
-  const client = await Lightclient.initializeFromCheckpointRoot({
-    config,
-    logger,
-    genesisData,
-    checkpointRoot,
-    transport,
-    // opts: {
-    //   allowForcedUpdates: true, // ?: boolean;
-    //   updateHeadersOnForcedUpdate: true, // ?: boolean;
-    // }
-  });
 
 
-  client.emitter.on(LightclientEvent.lightClientFinalityHeader, (header) => {
-    console.log('! beacon.slot:', header.beacon.slot);
-    fs.promises.appendFile(
-      path.resolve('data', `${ header.beacon.slot }.fin.json`),
-      JSON.stringify(header, replacer, 2),
-    )
-    .catch(ex => console.log(ex))
-  });
-  client.emitter.on(LightclientEvent.lightClientOptimisticHeader, (header) => {
-    console.log('? beacon.slot:', header.beacon.slot);
-    fs.promises.appendFile(
-      path.resolve('data', `${ header.beacon.slot }.opt.json`),
-      JSON.stringify(header, replacer, 2),
-    )
-    .catch(ex => console.log(ex))
-  });
-  client.emitter.on(LightclientEvent.statusChange, (code: RunStatusCode) => {
-    console.log(`#${ code } (${ RunStatusCodeName[code] })`);
-  });
-
-
-  client.start();
-}
-*/
 main().catch(ex => console.log(ex));
